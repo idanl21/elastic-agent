@@ -25,9 +25,11 @@ fi
 # This file is managed by an automation (mage integration:UpdateAgentPackageVersion) that check if the snapshot is ready.
 STACK_VERSION="$(jq -r '.version' .package-version)"
 STACK_BUILD_ID="$(jq -r '.stack_build_id' .package-version)"
-
-echo "~~~ Building test binaries"
-mage build:testBinaries
+if [[ "${FIPS:-false}" == "true" ]]; then
+  # FRH testing environment does not have same stack build IDs as CFT environment so
+  # we just go with the STACK_VERSION.
+  STACK_BUILD_ID=""
+fi
 
 # If the step is retried, we start the stack again.
 # BUILDKITE_RETRY_COUNT == "0" for the first run
@@ -61,6 +63,10 @@ if [[ "${GROUP_NAME}" == "kubernetes" ]]; then
   source .buildkite/scripts/install-kubectl.sh
   .buildkite/scripts/buildkite-k8s-integration-tests.sh $@
 else
+  # test binaries are needed only when running integration tests outside of k8s
+  echo "~~~ Building test binaries"
+  mage build:testBinaries
+  
   if [ "$TEST_SUDO" == "true" ]; then
     sudo -E .buildkite/scripts/buildkite-integration-tests.sh $@
   else

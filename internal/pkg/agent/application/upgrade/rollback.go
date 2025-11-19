@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -35,25 +36,84 @@ const (
 
 // Rollback rollbacks to previous version which was functioning before upgrade.
 func Rollback(ctx context.Context, log *logger.Logger, c client.Client, topDirPath, prevVersionedHome, prevHash string) error {
-	symlinkPath := filepath.Join(topDirPath, agentName)
+	return RollbackWithOpts(ctx, log, c, topDirPath, prevVersionedHome, prevHash)
+}
 
-	var symlinkTarget string
-	if prevVersionedHome != "" {
-		symlinkTarget = paths.BinaryPath(filepath.Join(topDirPath, prevVersionedHome), agentName)
-	} else {
-		// fallback for upgrades that didn't use the manifest and path remapping
-		hashedDir := fmt.Sprintf("%s-%s", agentName, prevHash)
-		// paths.BinaryPath properly derives the binary directory depending on the platform. The path to the binary for macOS is inside of the app bundle.
-		symlinkTarget = paths.BinaryPath(filepath.Join(paths.DataFrom(topDirPath), hashedDir), agentName)
+var FatalRollbackError = errors.New("fatal rollback error")
+
+type RollbackSettings struct {
+	SkipCleanup    bool
+	SkipRestart    bool
+	PreRestartHook RollbackHook
+	RemoveMarker   bool
+}
+
+func NewRollbackSettings(opts ...RollbackOpt) *RollbackSettings {
+	rs := new(RollbackSettings)
+	for _, opt := range opts {
+		opt(rs)
 	}
+	return rs
+}
+
+type RollbackOpt func(*RollbackSettings)
+
+func (r *RollbackSettings) SetSkipCleanup(skipCleanup bool) {
+	r.SkipCleanup = skipCleanup
+}
+
+func (r *RollbackSettings) SetSkipRestart(skipRestart bool) {
+	r.SkipRestart = skipRestart
+}
+
+func (r *RollbackSettings) SetPreRestartHook(preRestartHook RollbackHook) {
+	r.PreRestartHook = preRestartHook
+}
+
+func (r *RollbackSettings) SetRemoveMarker(removeMarker bool) {
+	r.RemoveMarker = removeMarker
+}
+
+func RollbackWithOpts(ctx context.Context, log *logger.Logger, c client.Client, topDirPath string, prevVersionedHome string, prevHash string, opts ...RollbackOpt) error {
+
+	settings := NewRollbackSettings(opts...)
+
+	symlinkPath := filepath.Join(topDirPath, AgentName)
+
+	if prevVersionedHome == "" {
+		// fallback for upgrades that didn't use the manifest and path remapping
+		hashedDir := fmt.Sprintf("%s-%s", AgentName, prevHash)
+		prevVersionedHome = filepath.Join("data", hashedDir)
+	}
+
+	// paths.BinaryPath properly derives the binary directory depending on the platform. The path to the binary for macOS is inside of the app bundle.
+	symlinkTarget := paths.BinaryPath(filepath.Join(topDirPath, prevVersionedHome), AgentName)
+
 	// change symlink
 	if err := changeSymlink(log, topDirPath, symlinkPath, symlinkTarget); err != nil {
 		return err
 	}
 
 	// revert active commit
-	if err := UpdateActiveCommit(log, topDirPath, prevHash); err != nil {
+	if err := UpdateActiveCommit(log, topDirPath, prevHash, os.WriteFile); err != nil {
 		return err
+	}
+
+	// Hook
+	if settings.PreRestartHook != nil {
+		hookErr := settings.PreRestartHook(ctx, log, topDirPath)
+		if hookErr != nil {
+			if errors.Is(hookErr, FatalRollbackError) {
+				return fmt.Errorf("pre-restart hook failed: %w", hookErr)
+			}
+
+			log.Warnf("pre-restart hook failed: %v", hookErr)
+		}
+	}
+
+	if settings.SkipRestart {
+		log.Info("Skipping restart")
+		return nil
 	}
 
 	// Restart
@@ -62,17 +122,22 @@ func Rollback(ctx context.Context, log *logger.Logger, c client.Client, topDirPa
 		return err
 	}
 
+	if settings.SkipCleanup {
+		log.Info("Skipping cleanup")
+		return nil
+	}
+
 	// cleanup everything except version we're rolling back into
-	return Cleanup(log, topDirPath, prevVersionedHome, prevHash, false, true)
+	return Cleanup(log, topDirPath, settings.RemoveMarker, true, prevVersionedHome)
 }
 
 // Cleanup removes all artifacts and files related to a specified version.
-func Cleanup(log *logger.Logger, topDirPath, currentVersionedHome, currentHash string, removeMarker, keepLogs bool) error {
-	return cleanup(log, topDirPath, currentVersionedHome, currentHash, removeMarker, keepLogs, afterRestartDelay)
+func Cleanup(log *logger.Logger, topDirPath string, removeMarker, keepLogs bool, versionedHomesToKeep ...string) error {
+	return cleanup(log, topDirPath, removeMarker, keepLogs, afterRestartDelay, versionedHomesToKeep...)
 }
 
-func cleanup(log *logger.Logger, topDirPath, currentVersionedHome, currentHash string, removeMarker, keepLogs bool, delay time.Duration) error {
-	log.Infow("Cleaning up upgrade", "hash", currentHash, "remove_marker", removeMarker)
+func cleanup(log *logger.Logger, topDirPath string, removeMarker, keepLogs bool, delay time.Duration, versionedHomesToKeep ...string) error {
+	log.Infow("Cleaning up upgrade", "remove_marker", removeMarker)
 	<-time.After(delay)
 
 	// data directory path
@@ -107,20 +172,20 @@ func cleanup(log *logger.Logger, topDirPath, currentVersionedHome, currentHash s
 	log.Infow("Removing previous symlink path", "file.path", prevSymlinkPath(topDirPath))
 	_ = os.Remove(prevSymlink)
 
-	dirPrefix := fmt.Sprintf("%s-", agentName)
-	var currentDir string
-	if currentVersionedHome != "" {
-		currentDir, err = filepath.Rel("data", currentVersionedHome)
+	dirPrefix := fmt.Sprintf("%s-", AgentName)
+
+	relativeHomePaths := make([]string, len(versionedHomesToKeep))
+	for i, h := range versionedHomesToKeep {
+		relHomePath, err := filepath.Rel("data", h)
 		if err != nil {
-			return fmt.Errorf("extracting elastic-agent path relative to data directory from %s: %w", currentVersionedHome, err)
+			return fmt.Errorf("extracting elastic-agent path relative to data directory from %s: %w", h, err)
 		}
-	} else {
-		currentDir = fmt.Sprintf("%s-%s", agentName, currentHash)
+		relativeHomePaths[i] = relHomePath
 	}
 
 	var errs []error
 	for _, dir := range subdirs {
-		if dir == currentDir {
+		if slices.Contains(relativeHomePaths, dir) {
 			continue
 		}
 
@@ -144,31 +209,61 @@ func cleanup(log *logger.Logger, topDirPath, currentVersionedHome, currentHash s
 
 // InvokeWatcher invokes an agent instance using watcher argument for watching behavior of
 // agent during upgrade period.
-func InvokeWatcher(log *logger.Logger, agentExecutable string) (*exec.Cmd, error) {
+func InvokeWatcher(log *logger.Logger, agentExecutable string, additionalWatchArgs ...string) (*exec.Cmd, error) {
 	if !IsUpgradeable() {
 		log.Info("agent is not upgradable, not starting watcher")
 		return nil, nil
 	}
-
-	cmd := invokeCmd(agentExecutable)
-	log.Infow("Starting upgrade watcher", "path", cmd.Path, "args", cmd.Args, "env", cmd.Env, "dir", cmd.Dir)
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start Upgrade Watcher: %w", err)
+	// invokeWatcherCmd and StartWatcherCmd are platform-specific functions dealing with process launching details.
+	cmd, err := StartWatcherCmd(log, func() *exec.Cmd { return invokeWatcherCmd(agentExecutable, additionalWatchArgs...) })
+	if err != nil {
+		return nil, fmt.Errorf("starting watcher process: %w", err)
 	}
 
 	upgradeWatcherPID := cmd.Process.Pid
 	agentPID := os.Getpid()
-
-	go func() {
-		if err := cmd.Wait(); err != nil {
-			log.Infow("Upgrade Watcher exited with error", "agent.upgrade.watcher.process.pid", "agent.process.pid", agentPID, upgradeWatcherPID, "error.message", err)
-		}
-	}()
-
 	log.Infow("Upgrade Watcher invoked", "agent.upgrade.watcher.process.pid", upgradeWatcherPID, "agent.process.pid", agentPID)
 
 	return cmd, nil
 
+}
+
+type WatcherInvocationOpt func(opts *watcherInvocationOptions)
+type watcherHook func()
+
+type watcherInvocationOptions struct {
+	postWatchHook watcherHook
+}
+
+func WithWatcherPostWaitHook(h watcherHook) WatcherInvocationOpt {
+	return func(opts *watcherInvocationOptions) {
+		opts.postWatchHook = h
+	}
+}
+
+func applyWatcherInvocationOpts(opts ...WatcherInvocationOpt) *watcherInvocationOptions {
+	invocationOpts := new(watcherInvocationOptions)
+	for _, opt := range opts {
+		opt(invocationOpts)
+	}
+	return invocationOpts
+}
+
+type cmdFactory func() *exec.Cmd
+
+func invokeWatcherCmd(agentExecutable string, additionalWatchArgs ...string) *exec.Cmd {
+	watchArgs := []string{
+		watcherSubcommand,
+		"--path.config", paths.Config(),
+		"--path.home", paths.Top(),
+	}
+
+	watchArgs = append(watchArgs, additionalWatchArgs...)
+
+	return InvokeCmdWithArgs(
+		agentExecutable,
+		watchArgs...,
+	)
 }
 
 func restartAgent(ctx context.Context, log *logger.Logger, c client.Client) error {

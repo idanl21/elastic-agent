@@ -30,15 +30,18 @@ import (
 
 	"github.com/elastic/elastic-agent-libs/kibana"
 	"github.com/elastic/elastic-agent-libs/logp"
+	monitoringLib "github.com/elastic/elastic-agent-libs/monitoring"
 	"github.com/elastic/elastic-agent-libs/transport/httpcommon"
 	"github.com/elastic/elastic-agent-libs/transport/tlscommon"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/enroll"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/monitoring"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/errors"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/storage"
 	"github.com/elastic/elastic-agent/internal/pkg/cli"
 	"github.com/elastic/elastic-agent/internal/pkg/config"
+	monitoringCfg "github.com/elastic/elastic-agent/internal/pkg/core/monitoring/config"
 	"github.com/elastic/elastic-agent/internal/pkg/crypto"
 	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	fleetclient "github.com/elastic/elastic-agent/internal/pkg/fleetapi/client"
@@ -145,6 +148,10 @@ be used when the same credentials will be used across all the possible actions a
   KIBANA_CA - path to certificate authority to use with communicate with Kibana [$ELASTICSEARCH_CA]
   ELASTIC_AGENT_TAGS - user provided tags for the agent [linux,staging]
 
+* Beats Receivers
+  The following experimental environment variables can be set to enable using Beats Receivers.
+
+  AGENT_MONITORING_RUNTIME_EXPERIMENTAL - Set to either "process" or "otel" to use the respective runtime for the monitoring components.
 
 * Elastic-Agent event logging
   If EVENTS_TO_STDERR is set to true log entries containing event data or whole raw events will be logged to stderr alongside
@@ -167,7 +174,7 @@ occurs on every start of the container set FLEET_FORCE to 1.
 }
 
 func logError(streams *cli.IOStreams, err error) {
-	fmt.Fprintf(streams.Err, "Error: %v\n%s\n", err, troubleshootMessage())
+	fmt.Fprintf(streams.Err, "Error: %v\n%s\n", err, troubleshootMessage)
 }
 
 func logInfo(streams *cli.IOStreams, a ...interface{}) {
@@ -296,6 +303,19 @@ func runContainerCmd(streams *cli.IOStreams, cfg setupConfig) error {
 		return err
 	}
 	if shouldEnroll {
+		// pre-enroll in container uses a logger and default monitoring configuration
+		// once the enrollment has occurred then it will pick up the final configuration
+		monitoringServer, err := monitoring.NewServer(logp.L(), monitoringLib.GetNamespace, nil, nil, monitoringCfg.DefaultConfig())
+		if err != nil {
+			return fmt.Errorf("failed starting monitoring server: %w", err)
+		}
+		monitoringServer.Start()
+		defer func() {
+			if monitoringServer != nil {
+				_ = monitoringServer.Stop()
+			}
+		}()
+
 		var policy *kibanaPolicy
 		token := cfg.Fleet.EnrollmentToken
 		if token == "" && !cfg.FleetServer.Enable {
@@ -340,6 +360,9 @@ func runContainerCmd(streams *cli.IOStreams, cfg setupConfig) error {
 		if err != nil {
 			return errors.New("enrollment failed", err)
 		}
+
+		_ = monitoringServer.Stop()
+		monitoringServer = nil
 	}
 
 	return run(containerCfgOverrides, false, initTimeout, isContainer)

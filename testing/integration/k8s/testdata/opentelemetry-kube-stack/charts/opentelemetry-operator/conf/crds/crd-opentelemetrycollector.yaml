@@ -4,7 +4,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     cert-manager.io/inject-ca-from: {{ include "opentelemetry-operator.webhookCertAnnotation" . }}
-    controller-gen.kubebuilder.io/version: v0.17.1
+    controller-gen.kubebuilder.io/version: v0.19.0
   creationTimestamp: null
   labels:
     app.kubernetes.io/name: opentelemetry-operator
@@ -17,7 +17,7 @@ spec:
       clientConfig:
         service:
           name: {{ template "opentelemetry-operator.fullname" . }}-webhook
-          namespace: {{ .Release.Namespace }}
+          namespace: {{ template "opentelemetry-operator.namespace" . }}
           path: /convert
           port: {{ .Values.admissionWebhooks.servicePort }}
 {{ if .caBundle }}{{ cat "caBundle:" .caBundle | indent 8 }}{{ end }}
@@ -2603,6 +2603,8 @@ spec:
                 type: object
               serviceAccount:
                 type: string
+              serviceName:
+                type: string
               shareProcessNamespace:
                 type: boolean
               targetAllocator:
@@ -3503,6 +3505,8 @@ spec:
                   - whenUnsatisfiable
                   type: object
                 type: array
+              trafficDistribution:
+                type: string
               updateStrategy:
                 properties:
                   rollingUpdate:
@@ -6959,6 +6963,11 @@ spec:
                 - sidecar
                 - statefulset
                 type: string
+              networkPolicy:
+                properties:
+                  enabled:
+                    type: boolean
+                type: object
               nodeSelector:
                 additionalProperties:
                   type: string
@@ -6971,6 +6980,10 @@ spec:
                         type: boolean
                       enableMetrics:
                         type: boolean
+                      extraLabels:
+                        additionalProperties:
+                          type: string
+                        type: object
                     type: object
                 type: object
               persistentVolumeClaimRetentionPolicy:
@@ -7261,6 +7274,8 @@ spec:
                     type: object
                 type: object
               serviceAccount:
+                type: string
+              serviceName:
                 type: string
               shareProcessNamespace:
                 type: boolean
@@ -7716,6 +7731,10 @@ spec:
                     default: 30s
                     format: duration
                     type: string
+                  collectorTargetReloadInterval:
+                    default: 30s
+                    format: duration
+                    type: string
                   enabled:
                     type: boolean
                   env:
@@ -7804,6 +7823,10 @@ spec:
                             type: boolean
                           enableMetrics:
                             type: boolean
+                          extraLabels:
+                            additionalProperties:
+                              type: string
+                            type: object
                         type: object
                     type: object
                   podDisruptionBudget:
@@ -8273,6 +8296,8 @@ spec:
                   - whenUnsatisfiable
                   type: object
                 type: array
+              trafficDistribution:
+                type: string
               upgradeStrategy:
                 enum:
                 - automatic
@@ -9286,7 +9311,6 @@ spec:
                 x-kubernetes-list-type: atomic
             required:
             - config
-            - managementState
             type: object
             x-kubernetes-validations:
             - message: the OpenTelemetry Collector mode is set to sidecar, which does

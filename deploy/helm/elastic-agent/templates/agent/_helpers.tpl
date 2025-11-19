@@ -89,14 +89,15 @@ Initialise input templates if we are not deploying as managed
  as they change the k8s configuration of presets e.g. necessary volume mounts, etc. */}}
 {{- include "elasticagent.kubernetes.init" $ -}}
 {{- include "elasticagent.system.init" $ -}}
+{{- include "elasticagent.autoops.init" $ -}}
 {{/* initialise inputs the custom integrations only if fleet is disabled */}}
 {{- if eq $.Values.agent.fleet.enabled false -}}
 {{- range $customInputName, $customInputVal := $.Values.extraIntegrations -}}
 {{- $customInputPresetName := ($customInputVal).preset -}}
 {{- $presetVal := get $.Values.agent.presets $customInputPresetName -}}
 {{- $_ := required (printf "preset with name \"%s\" of customInput \"%s\" not defined" $customInputPresetName $customInputName) $customInputVal -}}
-{{- $customInputOuput := ($customInputVal).use_output -}}
-{{- include "elasticagent.preset.mutate.outputs.byname" (list $ $presetVal $customInputOuput) -}}
+{{- $customInputOutput := ($customInputVal).use_output -}}
+{{- include "elasticagent.preset.mutate.outputs.byname" (list $ $presetVal $customInputOutput) -}}
 {{- include "elasticagent.preset.mutate.inputs" (list $ $presetVal (list $customInputVal)) -}}
 {{- end -}}
 {{- end -}}
@@ -258,10 +259,10 @@ Mutate an agent preset based on agent.fleet
 {{- $extraEnvs = append $extraEnvs (dict "name" "FLEET_ENROLLMENT_TOKEN" "value" $.Values.agent.fleet.token) -}}
 {{- end -}}
 {{- if $.Values.agent.fleet.insecure -}}
-{{- $extraEnvs = append $extraEnvs (dict "name" "FLEET_INSECURE" "value" (quote $.Values.agent.fleet.insecure)) -}}
+{{- $extraEnvs = append $extraEnvs (dict "name" "FLEET_INSECURE" "value" (printf "%t" $.Values.agent.fleet.insecure)) -}}
 {{- end -}}
 {{- if $.Values.agent.fleet.force -}}
-{{- $extraEnvs = append $extraEnvs (dict "name" "FLEET_FORCE" "value" (quote $.Values.agent.fleet.force)) -}}
+{{- $extraEnvs = append $extraEnvs (dict "name" "FLEET_FORCE" "value" (printf "%t"  $.Values.agent.fleet.force)) -}}
 {{- end -}}
 {{- if $.Values.agent.fleet.tokenName -}}
 {{- $extraEnvs = append $extraEnvs (dict "name" "FLEET_TOKEN_NAME" "value" $.Values.agent.fleet.tokenName) -}}
@@ -351,7 +352,7 @@ app.kubernetes.io/version: {{ .Values.agent.version}}
 {{- $presetVal := index . 1 -}}
 {{- $otelConfigVal := index . 2 -}}
 {{- $presetOtelConfig := dig "otelConfig" (dict) $presetVal -}}
-{{- $presetOtelConfig = uniq (deepCopy $presetOtelConfig | merge $otelConfigVal) -}}
+{{- $presetOtelConfig = (deepCopy $presetOtelConfig | merge $otelConfigVal) -}}
 {{- $_ := set $presetVal "otelConfig" $presetOtelConfig -}}
 {{- end -}}
 
@@ -458,9 +459,9 @@ app.kubernetes.io/version: {{ .Values.agent.version}}
 {{- $ := index . 0 -}}
 {{- $preset := index . 1 -}}
 {{- $outputName := index . 2 -}}
-{{- $ouputVal := get $.Values.outputs $outputName }}
-{{- $_ := required (printf "output \"%s\" is not defined" $outputName) $ouputVal -}}
-{{- $outputCopy := deepCopy $ouputVal -}}
+{{- $outputVal := get $.Values.outputs $outputName }}
+{{- $_ := required (printf "output \"%s\" is not defined" $outputName) $outputVal -}}
+{{- $outputCopy := deepCopy $outputVal -}}
 {{- $presetOutputs := dig "outputs" (dict) $preset -}}
 {{- if not (hasKey $presetOutputs $outputName) -}}
 {{- $_ := set $presetOutputs $outputName $outputCopy}}

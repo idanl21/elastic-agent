@@ -6,26 +6,23 @@ package cmd
 
 import (
 	"flag"
-	"fmt"
 	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
+
+	edotCmd "github.com/elastic/elastic-agent/internal/edot/cmd"
 
 	// import logp flags
 	_ "github.com/elastic/elastic-agent-libs/logp/configure"
 
 	"github.com/elastic/elastic-agent/internal/pkg/basecmd"
 	"github.com/elastic/elastic-agent/internal/pkg/cli"
-	"github.com/elastic/elastic-agent/internal/pkg/release"
 	"github.com/elastic/elastic-agent/version"
 )
 
-func troubleshootMessage() string {
-	v := strings.Split(release.Version(), ".")
-	version := strings.Join(v[:2], ".")
-	return fmt.Sprintf("For help, please see our troubleshooting guide at https://www.elastic.co/guide/en/fleet/%s/fleet-troubleshooting.html", version)
-}
+const (
+	troubleshootMessage = "For help, please see our troubleshooting guide at https://www.elastic.co/docs/troubleshoot/ingest/fleet/common-problems"
+)
 
 // NewCommand returns the default command for the agent.
 func NewCommand() *cobra.Command {
@@ -93,7 +90,7 @@ func NewCommandWithArgs(args []string, streams *cli.IOStreams) *cobra.Command {
 	cmd.AddCommand(newDiagnosticsCommand(args, streams))
 	cmd.AddCommand(newComponentCommandWithArgs(args, streams))
 	cmd.AddCommand(newLogsCommandWithArgs(args, streams))
-	cmd.AddCommand(newOtelCommandWithArgs(args, streams))
+	cmd.AddCommand(edotCmd.NewOtelCommandWithArgs(args, streams))
 	cmd.AddCommand(newApplyFlavorCommandWithArgs(args, streams))
 
 	// windows special hidden sub-command (only added on Windows)

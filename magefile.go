@@ -39,7 +39,7 @@ import (
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/otiai10/copy"
 
-	devmachine "github.com/elastic/elastic-agent/dev-tools/devmachine"
+	"github.com/elastic/elastic-agent/dev-tools/devmachine"
 	"github.com/elastic/elastic-agent/dev-tools/mage"
 	devtools "github.com/elastic/elastic-agent/dev-tools/mage"
 	"github.com/elastic/elastic-agent/dev-tools/mage/downloads"
@@ -235,58 +235,13 @@ func (Dev) Package(ctx context.Context) {
 	Package(ctx)
 }
 
-func mocksPath() (string, error) {
-	repositoryRoot, err := findRepositoryRoot()
-	if err != nil {
-		return "", fmt.Errorf("finding repository root: %w", err)
-	}
-	return filepath.Join(repositoryRoot, "testing", "mocks"), nil
-}
-
-func (Dev) CleanMocks() error {
-	mPath, err := mocksPath()
-	if err != nil {
-		return fmt.Errorf("retrieving mocks path: %w", err)
-	}
-	err = os.RemoveAll(mPath)
-	if err != nil {
-		return fmt.Errorf("removing mocks: %w", err)
-	}
-	return nil
-}
-
 func (Dev) RegenerateMocks() error {
-	mg.Deps(Dev.CleanMocks)
 	err := sh.Run("mockery")
 	if err != nil {
 		return fmt.Errorf("generating mocks: %w", err)
 	}
 
-	// change CWD
-	workingDir, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("retrieving CWD: %w", err)
-	}
-	// restore the working directory when exiting the function
-	defer func() {
-		err := os.Chdir(workingDir)
-		if err != nil {
-			panic(fmt.Errorf("failed to restore working dir %q: %w", workingDir, err))
-		}
-	}()
-
-	mPath, err := mocksPath()
-	if err != nil {
-		return fmt.Errorf("retrieving mocks path: %w", err)
-	}
-
-	err = os.Chdir(mPath)
-	if err != nil {
-		return fmt.Errorf("changing current directory to %q: %w", mPath, err)
-	}
-
-	mg.Deps(devtools.AddLicenseHeaders)
-	mg.Deps(devtools.GoImports)
+	mg.Deps(devtools.Format)
 	return nil
 }
 
@@ -306,11 +261,11 @@ func (Build) GenerateConfig() error {
 	return sh.Copy(filepath.Join(buildDir, configFile), filepath.Join(metaDir, configFile))
 }
 
-// WindowsArchiveRootBinary compiles a binary to be placed at the root of the windows elastic-agent archive. This binary
+// windowsArchiveRootBinaryForGoArch compiles a binary to be placed at the root of the windows elastic-agent archive. This binary
 // is a thin proxy to the actual elastic-agent binary that resides in the data/elastic-agent-{commit-short-sha}
 // directory of the archive.
-func (Build) WindowsArchiveRootBinary() error {
-	fmt.Println("--- Compiling root binary for windows archive")
+func (Build) windowsArchiveRootBinaryForGoArch(goarch string) error {
+	fmt.Printf("--- Compiling root binary for %s windows archive\n", goarch)
 	hashShort, err := devtools.CommitHashShort()
 	if err != nil {
 		return fmt.Errorf("error getting commit hash: %w", err)
@@ -324,7 +279,7 @@ func (Build) WindowsArchiveRootBinary() error {
 
 	args := devtools.BuildArgs{
 		Name:        outputName,
-		OutputDir:   filepath.Join(buildDir, "windows-archive-root-binary"),
+		OutputDir:   filepath.Join(buildDir, fmt.Sprintf("windows-%s-archive-root-binary", goarch)),
 		InputFiles:  []string{"wrapper/windows/archive-proxy/main.go"},
 		CGO:         false,
 		WinMetadata: true,
@@ -337,7 +292,7 @@ func (Build) WindowsArchiveRootBinary() error {
 		},
 		Env: map[string]string{
 			"GOOS":   "windows",
-			"GOARCH": "amd64",
+			"GOARCH": goarch,
 		},
 		LDFlags: []string{
 			"-s", // Strip all debug symbols from binary (does not affect Go stack traces).
@@ -355,6 +310,13 @@ func (Build) WindowsArchiveRootBinary() error {
 	return devtools.Build(args)
 }
 
+// WindowsArchiveRootBinary compiles a binary to be placed at the root of the windows elastic-agent archive. This binary
+// is a thin proxy to the actual elastic-agent binary that resides in the data/elastic-agent-{commit-short-sha}
+// directory of the archive.
+func (Build) WindowsArchiveRootBinary() {
+	mg.Deps(mg.F(Build.windowsArchiveRootBinaryForGoArch, devtools.GOARCH))
+}
+
 // GolangCrossBuildOSS build the Beat binary inside of the golang-builder.
 // Do not use directly, use crossBuild instead.
 func GolangCrossBuildOSS() error {
@@ -368,6 +330,7 @@ func GolangCrossBuildOSS() error {
 func GolangCrossBuild() error {
 	params := devtools.DefaultGolangCrossBuildArgs()
 	params.OutputDir = "build/golang-crossbuild"
+	params.Package = "github.com/elastic/elastic-agent"
 	injectBuildVars(params.Vars)
 
 	if err := devtools.GolangCrossBuild(params); err != nil {
@@ -438,6 +401,7 @@ func getTestBinariesPath() ([]string, error) {
 		filepath.Join(wd, "internal", "pkg", "agent", "install", "testblocking"),
 		filepath.Join(wd, "pkg", "core", "process", "testsignal"),
 		filepath.Join(wd, "internal", "pkg", "otel", "manager", "testing"),
+		filepath.Join(wd, "internal", "pkg", "agent", "application", "filelock", "testlocker"),
 	}
 	return testBinaryPkgs, nil
 }
@@ -449,6 +413,20 @@ func (Build) TestBinaries() error {
 		fmt.Errorf("cannot build test binaries: %w", err)
 	}
 
+	args := []string{"build", "-v"}
+	if runtime.GOOS == "darwin" {
+		osMajorVer, err := getMacOSMajorVersion()
+		if err != nil {
+			return fmt.Errorf("cannot determine darwin OS major version: %w", err)
+		}
+
+		if osMajorVer > 13 {
+			// Workaround for https://github.com/golang/go/issues/67854 until it
+			// is resolved.
+			args = append(args, "-ldflags", "-extldflags='-ld_classic'")
+		}
+	}
+
 	for _, pkg := range testBinaryPkgs {
 		binary := filepath.Base(pkg)
 		if runtime.GOOS == "windows" {
@@ -456,7 +434,7 @@ func (Build) TestBinaries() error {
 		}
 
 		outputName := filepath.Join(pkg, binary)
-		err := RunGo("build", "-o", outputName, filepath.Join(pkg))
+		err := devtools.Run(nil, nil, os.Stderr, "go", pkg, "build", "-v", "-o", outputName, pkg)
 		if err != nil {
 			return err
 		}
@@ -490,7 +468,7 @@ func (Check) Changes() error {
 	if len(out) != 0 {
 		fmt.Fprintln(os.Stderr, "Changes:")
 		fmt.Fprintln(os.Stderr, out)
-		return fmt.Errorf("uncommited changes")
+		return fmt.Errorf("uncommitted changes")
 	}
 	return nil
 }
@@ -566,7 +544,7 @@ func Package(ctx context.Context) error {
 	start := time.Now()
 	defer func() { fmt.Println("package ran for", time.Since(start)) }()
 
-	platforms := devtools.Platforms.Names()
+	platforms := devtools.Platforms
 	if len(platforms) == 0 {
 		panic("elastic-agent package is expected to build at least one platform package")
 	}
@@ -955,7 +933,7 @@ func (Cloud) Image(ctx context.Context) {
 	os.Setenv(dockerVariants, "cloud")
 
 	if s, err := strconv.ParseBool(snapshot); err == nil && !s {
-		// only disable SNAPSHOT build when explicitely defined
+		// only disable SNAPSHOT build when explicitly defined
 		os.Setenv(snapshotEnv, "false")
 		devtools.Snapshot = false
 	} else {
@@ -1131,8 +1109,8 @@ func runAgent(ctx context.Context, env map[string]string) error {
 		}
 
 		// produce docker package
-		packageAgent(ctx, []string{
-			"linux/amd64",
+		packageAgent(ctx, devtools.BuildPlatformList{
+			devtools.BuildPlatform{Name: "linux/amd64"},
 		}, dependenciesVersion, nil, mg.F(devtools.UseElasticAgentDemoPackaging), mg.F(CrossBuild), devtools.SelectedPackageTypes)
 
 		dockerPackagePath := filepath.Join("build", "package", "elastic-agent", "elastic-agent-linux-amd64.docker", "docker-build")
@@ -1180,7 +1158,7 @@ func runAgent(ctx context.Context, env map[string]string) error {
 	return sh.Run("docker", dockerCmdArgs...)
 }
 
-func packageAgent(ctx context.Context, platforms []string, dependenciesVersion string, manifestResponse *manifest.Build, agentPackaging, agentBinaryTarget mg.Fn, packageTypes []mage.PackageType) error {
+func packageAgent(ctx context.Context, platforms devtools.BuildPlatformList, dependenciesVersion string, manifestResponse *manifest.Build, agentPackaging, agentBinaryTarget mg.Fn, packageTypes []mage.PackageType) error {
 	fmt.Println("--- Package Elastic-Agent")
 
 	if mg.Verbose() {
@@ -1199,12 +1177,16 @@ func packageAgent(ctx context.Context, platforms []string, dependenciesVersion s
 		log.Printf("dependencies extracted from package specs: %v", dependencies)
 	}
 
+	keepArchive := os.Getenv("KEEP_ARCHIVE") != ""
+
 	// download/copy all the necessary dependencies for packaging elastic-agent
-	archivePath, dropPath, dependencies := collectPackageDependencies(platforms, dependenciesVersion, packageTypes, dependencies)
+	archivePath, dropPath, dependencies := collectPackageDependencies(platforms.Names(), dependenciesVersion, packageTypes, dependencies)
 
 	// cleanup after build
-	defer os.RemoveAll(archivePath)
-	defer os.RemoveAll(dropPath)
+	if !keepArchive {
+		defer os.RemoveAll(archivePath)
+		defer os.RemoveAll(dropPath)
+	}
 	defer os.Unsetenv(agentDropPath)
 
 	// create flat dir
@@ -1216,7 +1198,7 @@ func packageAgent(ctx context.Context, platforms []string, dependenciesVersion s
 	defer os.RemoveAll(flatPath)
 
 	// extract all dependencies from their archives into flat dir
-	flattenDependencies(platforms, dependenciesVersion, archivePath, dropPath, flatPath, manifestResponse, dependencies)
+	flattenDependencies(platforms.Names(), dependenciesVersion, archivePath, dropPath, flatPath, manifestResponse, dependencies)
 
 	// package agent
 	log.Println("--- Running post packaging ")
@@ -1224,8 +1206,10 @@ func packageAgent(ctx context.Context, platforms []string, dependenciesVersion s
 	mg.Deps(agentBinaryTarget)
 
 	// compile the elastic-agent.exe proxy binary for the windows archive
-	if slices.Contains(platforms, "windows/amd64") {
-		mg.Deps(Build.WindowsArchiveRootBinary)
+	for _, p := range platforms {
+		if p.GOOS() == "windows" {
+			mg.Deps(mg.F(Build.windowsArchiveRootBinaryForGoArch, p.GOARCH()))
+		}
 	}
 
 	mg.SerialDeps(devtools.Package, TestPackages)
@@ -1288,14 +1272,7 @@ func collectPackageDependencies(platforms []string, packageVersion string, packa
 					if mg.Verbose() {
 						log.Printf(">>> Looking for component %s/%s", spec.BinaryName, platform)
 					}
-					for _, pkgType := range packageTypes {
-						if mg.Verbose() {
-							log.Printf(">>> Evaluating pkgType %v for component %s/%s", pkgType, spec.BinaryName, platform)
-						}
-						if !spec.SupportsPackageType(pkgcommon.PackageType(pkgType)) {
-							log.Printf(">>> PkgType %v for component %s/%s not supported. Skipping...", pkgType, spec.BinaryName, platform)
-							continue
-						}
+					if supportsAtLeastOnePackageType(platform, spec, packageTypes) {
 						targetPath := filepath.Join(archivePath, manifest.PlatformPackages[platform])
 						os.MkdirAll(targetPath, 0o755)
 						packageName := spec.GetPackageName(packageVersion, platform)
@@ -1390,6 +1367,23 @@ func collectPackageDependencies(platforms []string, packageVersion string, packa
 		archivePath = movePackagesToArchive(dropPath, platforms, packageVersion, dependencies)
 	}
 	return archivePath, dropPath, dependencies
+}
+
+func supportsAtLeastOnePackageType(platform string, spec packaging.BinarySpec, packageTypes []devtools.PackageType) bool {
+	for _, pkgType := range packageTypes {
+		if mg.Verbose() {
+			log.Printf(">>> Evaluating pkgType %v for component %s/%s", pkgType, spec.BinaryName, platform)
+		}
+		if !spec.SupportsPackageType(pkgcommon.PackageType(pkgType)) {
+			continue
+		}
+		if mg.Verbose() {
+			log.Printf(">>> Selecting component %s/%s because of pkgType %s", spec.BinaryName, platform, pkgType)
+		}
+		return true
+	}
+	log.Printf(">>> Component %s/%s not supported for any of the selected package types %v. Skipping...", spec.BinaryName, platform, packageTypes)
+	return false
 }
 
 func removePythonWheels(matches []string, version string, dependencies []packaging.BinarySpec) []string {
@@ -1552,7 +1546,7 @@ func PackageUsingDRA(ctx context.Context) error {
 	start := time.Now()
 	defer func() { fmt.Println("package ran for", time.Since(start)) }()
 
-	platforms := devtools.Platforms.Names()
+	platforms := devtools.Platforms
 	if len(platforms) == 0 {
 		return fmt.Errorf("elastic-agent package is expected to build at least one platform package")
 	}
@@ -3198,7 +3192,7 @@ func createTestRunner(matrix bool, singleTest string, goTestFlags string, batche
 	}
 
 	provisionCfg := ess.ProvisionerConfig{
-		Identifier: fmt.Sprintf("at-%s", strings.Replace(strings.Split(email, "@")[0], ".", "-", -1)),
+		Identifier: fmt.Sprintf("at-%s", strings.ReplaceAll(strings.Split(email, "@")[0], ".", "-")),
 		APIKey:     essToken,
 		Region:     essRegion,
 	}
@@ -3446,7 +3440,7 @@ func authGCP(ctx context.Context) error {
 	var svcList []struct {
 		Email string `json:"email"`
 	}
-	serviceAcctName := fmt.Sprintf("%s-agent-testing", strings.Replace(parts[0], ".", "-", -1))
+	serviceAcctName := fmt.Sprintf("%s-agent-testing", strings.ReplaceAll(parts[0], ".", "-"))
 	iamAcctName := fmt.Sprintf("%s@%s.iam.gserviceaccount.com", serviceAcctName, project)
 	cmd = exec.CommandContext(ctx, cliName, "iam", "service-accounts", "list", "--format=json")
 	output, err = cmd.Output()
@@ -3648,7 +3642,7 @@ func (Otel) Readme() error {
 		return fmt.Errorf("failed to parse README template: %w", err)
 	}
 
-	data, err := otel.GetOtelDependencies("go.mod")
+	data, err := otel.GetOtelDependencies(filepath.Join("internal", "edot", "go.mod"))
 	if err != nil {
 		return fmt.Errorf("Failed to get OTel dependencies: %w", err)
 	}
@@ -4154,4 +4148,19 @@ func loadYamlFile(path string) (map[string]any, error) {
 		return nil, err
 	}
 	return data, nil
+}
+
+func getMacOSMajorVersion() (int, error) {
+	ver, err := sh.Output("sw_vers", "-productVersion")
+	if err != nil {
+		return 0, err
+	}
+
+	majorVerStr := strings.Split(ver, ".")[0]
+	majorVer, err := strconv.Atoi(majorVerStr)
+	if err != nil {
+		return 0, fmt.Errorf("unable to parse major version from %q: %w", ver, err)
+	}
+
+	return majorVer, nil
 }

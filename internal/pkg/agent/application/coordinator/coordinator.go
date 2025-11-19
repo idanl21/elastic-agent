@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/elastic/elastic-agent/internal/pkg/core/backoff"
+	"github.com/elastic/elastic-agent/internal/pkg/otel/translate"
 
 	"go.opentelemetry.io/collector/component/componentstatus"
 
@@ -31,6 +33,7 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/reexec"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade"
+	upgradeErrors "github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/artifact/download/errors"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/protection"
@@ -59,6 +62,8 @@ const (
 
 var ErrNotManaged = errors.New("unmanaged agent")
 
+var ErrContainerNotSupported = errors.New("unsupported action: agent runs in a container")
+
 var ErrFleetServer = errors.New("unsupported action: agent runs Fleet server")
 
 // ErrNotUpgradable error is returned when upgrade cannot be performed.
@@ -85,7 +90,7 @@ type UpgradeManager interface {
 	Reload(rawConfig *config.Config) error
 
 	// Upgrade upgrades running agent.
-	Upgrade(ctx context.Context, version string, sourceURI string, action *fleetapi.ActionUpgrade, details *details.Details, skipVerifyOverride bool, skipDefaultPgp bool, pgpBytes ...string) (_ reexec.ShutdownCallbackFn, err error)
+	Upgrade(ctx context.Context, version string, rollback bool, sourceURI string, action *fleetapi.ActionUpgrade, details *details.Details, skipVerifyOverride bool, skipDefaultPgp bool, pgpBytes ...string) (_ reexec.ShutdownCallbackFn, err error)
 
 	// Ack is used on startup to check if the agent has upgraded and needs to send an ack for the action
 	Ack(ctx context.Context, acker acker.Acker) error
@@ -102,7 +107,7 @@ type MonitorManager interface {
 	// Enabled when configured to collect metrics/logs.
 	Enabled() bool
 
-	// Reload reloads the configuration for the upgrade manager.
+	// Reload reloads the configuration for the monitoring manager.
 	Reload(rawConfig *config.Config) error
 
 	// MonitoringConfig injects monitoring configuration into resolved ast tree.
@@ -225,6 +230,11 @@ type ComponentsModifier func(comps []component.Component, cfg map[string]interfa
 
 // managerShutdownTimeout is how long the coordinator will wait during shutdown
 // to receive termination states from its managers.
+// Note: The current timeout (5s) is shorter than the default stop timeout for
+// subprocess components (30s from process.DefaultConfig()). This means the
+// coordinator may not wait for the subprocesses to finish terminating, preventing
+// Wait() from being called on them. This will result in zombie processes
+// during restart on Unix systems.
 const managerShutdownTimeout = time.Second * 5
 
 type configReloader interface {
@@ -357,6 +367,14 @@ type Coordinator struct {
 	// run a ticker that checks to see if we have a new PID.
 	componentPIDTicker         *time.Ticker
 	componentPidRequiresUpdate *atomic.Bool
+
+	// Abstraction for diagnostics AddSecretMarkers function for testability
+	secretMarkerFunc func(*logger.Logger, *config.Config) error
+
+	// migrationProgressWg is used to block processing of incoming policies after enroll is done
+	// incomming policies are blocked until we reboot so components receiving proxied MIGRATE action
+	// are not confused
+	migrationProgressWg sync.WaitGroup
 }
 
 // The channels Coordinator reads to receive updates from the various managers.
@@ -420,6 +438,7 @@ func New(
 	isManaged bool,
 	otelMgr OTelManager,
 	fleetAcker acker.Acker,
+	initialUpgradeDetails *details.Details,
 	modifiers ...ComponentsModifier,
 ) *Coordinator {
 	var fleetState cproto.State
@@ -430,11 +449,12 @@ func New(
 		fleetMessage = "Not enrolled into Fleet"
 	}
 	state := State{
-		State:        agentclient.Starting,
-		Message:      "Starting",
-		FleetState:   fleetState,
-		FleetMessage: fleetMessage,
-		LogLevel:     logLevel,
+		State:          agentclient.Starting,
+		Message:        "Starting",
+		FleetState:     fleetState,
+		FleetMessage:   fleetMessage,
+		LogLevel:       logLevel,
+		UpgradeDetails: initialUpgradeDetails,
 	}
 	c := &Coordinator{
 		logger:     logger,
@@ -476,7 +496,8 @@ func New(
 		componentPIDTicker:         time.NewTicker(time.Second * 30),
 		componentPidRequiresUpdate: &atomic.Bool{},
 
-		fleetAcker: fleetAcker,
+		fleetAcker:       fleetAcker,
+		secretMarkerFunc: diagnostics.AddSecretMarkers,
 	}
 	// Setup communication channels for any non-nil components. This pattern
 	// lets us transparently accept nil managers / simulated events during
@@ -589,7 +610,15 @@ func (c *Coordinator) ReExec(callback reexec.ShutdownCallbackFn, argOverrides ..
 
 // Migrate migrates agent to a new cluster and ACKs success to the old one.
 // In case of failure no ack is performed and error is returned.
-func (c *Coordinator) Migrate(ctx context.Context, action *fleetapi.ActionMigrate, backoffFactory func(done <-chan struct{}) backoff.Backoff) error {
+func (c *Coordinator) Migrate(
+	ctx context.Context,
+	action *fleetapi.ActionMigrate,
+	backoffFactory func(done <-chan struct{}) backoff.Backoff,
+	notifyFn func(context.Context, *fleetapi.ActionMigrate) error,
+) error {
+	if c.specs.Platform().OS == component.Container {
+		return ErrContainerNotSupported
+	}
 	if !c.isManaged {
 		return ErrNotManaged
 	}
@@ -653,10 +682,29 @@ func (c *Coordinator) Migrate(ctx context.Context, action *fleetapi.ActionMigrat
 		options,
 		store,
 		backoffFactory,
+		3, // try enrollment for 3 times and fail
 	)
 	if err != nil {
 		restoreErr := RestoreConfig()
 		return errors.Join(fmt.Errorf("failed to enroll: %w", err), restoreErr)
+	}
+
+	// lock processing of new config before notifying components
+	// hold lock until notification failure or reexec
+	c.migrationProgressWg.Add(1)
+	if notifyFn != nil {
+		// notify before completing migration
+		// components such endpoint are crucial to work even though it's on stale cluster
+		// error on component side is returned as part of Action response
+		if err := notifyFn(ctx, action); err != nil {
+			restoreErr := RestoreConfig()
+
+			// in case of failure no need to lock processing
+			// safe to forward policy from source cluster
+			c.migrationProgressWg.Done()
+
+			return errors.Join(fmt.Errorf("failed to notify components: %w", err), restoreErr)
+		}
 	}
 
 	// ACK success to source fleet server
@@ -670,38 +718,78 @@ func (c *Coordinator) Migrate(ctx context.Context, action *fleetapi.ActionMigrat
 		return fmt.Errorf("failed to clean backup config: %w", err)
 	}
 
+	c.bestEffortUnenroll(ctx, originalOptions)
+
+	return nil
+}
+
+func (c *Coordinator) bestEffortUnenroll(ctx context.Context, originalOptions enroll.EnrollOptions) {
 	originalRemoteConfig, err := originalOptions.RemoteConfig(false)
 	if err != nil {
-		return fmt.Errorf("failed to construct original remote config: %w", err)
+		c.logger.Warnf("failed to construct original remote config: %v", err)
+		return
 	}
 
 	originalClient, err := fleetapiClient.NewAuthWithConfig(
 		c.logger, originalOptions.EnrollAPIKey, originalRemoteConfig)
 	if err != nil {
-		return fmt.Errorf("failed to create original fleet client: %w", err)
+		c.logger.Warnf("failed to create original fleet client: %v", err)
+		return
 	}
 
 	// Best effort: call unenroll on source cluster once done
 	if err := c.unenroll(ctx, originalClient); err != nil {
 		c.logger.Warnf("failed to unenroll from original cluster: %v", err)
+		return
 	}
+}
 
-	return nil
+type upgradeOpts struct {
+	skipVerifyOverride bool
+	skipDefaultPgp     bool
+	pgpBytes           []string
+	preUpgradeCallback func(ctx context.Context, log *logger.Logger, action *fleetapi.ActionUpgrade) error
+	rollback           bool
+}
+
+type UpgradeOpt func(*upgradeOpts)
+
+func WithSkipVerifyOverride(skipVerifyOverride bool) UpgradeOpt {
+	return func(opts *upgradeOpts) {
+		opts.skipVerifyOverride = skipVerifyOverride
+	}
+}
+
+func WithSkipDefaultPgp(skipDefaultPgp bool) UpgradeOpt {
+	return func(opts *upgradeOpts) {
+		opts.skipDefaultPgp = skipDefaultPgp
+	}
+}
+
+func WithPgpBytes(pgpBytes []string) UpgradeOpt {
+	return func(opts *upgradeOpts) {
+		opts.pgpBytes = pgpBytes
+	}
+}
+
+func WithPreUpgradeCallback(preUpgradeCallback func(ctx context.Context, log *logger.Logger, action *fleetapi.ActionUpgrade) error) UpgradeOpt {
+	return func(opts *upgradeOpts) {
+		opts.preUpgradeCallback = preUpgradeCallback
+	}
+}
+
+func WithRollback(rollback bool) UpgradeOpt {
+	return func(opts *upgradeOpts) {
+		opts.rollback = rollback
+	}
 }
 
 // Upgrade runs the upgrade process.
 // Called from external goroutines.
-func (c *Coordinator) Upgrade(ctx context.Context, version string, sourceURI string, action *fleetapi.ActionUpgrade, skipVerifyOverride bool, skipDefaultPgp bool, pgpBytes ...string) error {
-	// early check outside of upgrader before overriding the state
-	if !c.upgradeMgr.Upgradeable() {
-		return ErrNotUpgradable
-	}
-
-	// early check capabilities to ensure this upgrade actions is allowed
-	if c.caps != nil {
-		if !c.caps.AllowUpgrade(version, sourceURI) {
-			return ErrNotUpgradable
-		}
+func (c *Coordinator) Upgrade(ctx context.Context, version string, sourceURI string, action *fleetapi.ActionUpgrade, opts ...UpgradeOpt) error {
+	var uOpts upgradeOpts
+	for _, opt := range opts {
+		opt(&uOpts)
 	}
 
 	// A previous upgrade may be cancelled and needs some time to
@@ -709,7 +797,8 @@ func (c *Coordinator) Upgrade(ctx context.Context, version string, sourceURI str
 	var err error
 	for i := 0; i < 5; i++ {
 		s := c.State()
-		if s.State != agentclient.Upgrading {
+		// if we are not already upgrading or if the incoming is a rollback request while the watcher is running, we can continue processing
+		if s.State != agentclient.Upgrading || (uOpts.rollback && s.UpgradeDetails != nil && s.UpgradeDetails.State == details.StateWatching) {
 			err = nil
 			break
 		}
@@ -731,7 +820,32 @@ func (c *Coordinator) Upgrade(ctx context.Context, version string, sourceURI str
 	det := details.NewDetails(version, details.StateRequested, actionID)
 	det.RegisterObserver(c.SetUpgradeDetails)
 
-	cb, err := c.upgradeMgr.Upgrade(ctx, version, sourceURI, action, det, skipVerifyOverride, skipDefaultPgp, pgpBytes...)
+	// early check outside of upgrader before overriding the state
+	if !c.upgradeMgr.Upgradeable() {
+		c.ClearOverrideState()
+		det.Fail(ErrNotUpgradable)
+		return ErrNotUpgradable
+	}
+
+	// early check capabilities to ensure this upgrade actions is allowed
+	if c.caps != nil {
+		if !c.caps.AllowUpgrade(version, sourceURI) {
+			c.ClearOverrideState()
+			det.Fail(ErrNotUpgradable)
+			return ErrNotUpgradable
+		}
+	}
+
+	// run any pre upgrade callback
+	if uOpts.preUpgradeCallback != nil {
+		if err := uOpts.preUpgradeCallback(ctx, c.logger, action); err != nil {
+			c.ClearOverrideState()
+			det.Fail(err)
+			return err
+		}
+	}
+
+	cb, err := c.upgradeMgr.Upgrade(ctx, version, uOpts.rollback, sourceURI, action, det, uOpts.skipVerifyOverride, uOpts.skipDefaultPgp, uOpts.pgpBytes...)
 	if err != nil {
 		c.ClearOverrideState()
 		if errors.Is(err, upgrade.ErrUpgradeSameVersion) {
@@ -739,6 +853,15 @@ func (c *Coordinator) Upgrade(ctx context.Context, version string, sourceURI str
 			det.SetState(details.StateCompleted)
 			return c.upgradeMgr.AckAction(ctx, c.fleetAcker, action)
 		}
+
+		c.logger.Errorw("upgrade failed", "error", logp.Error(err))
+		// If ErrInsufficientDiskSpace is in the error chain, we want to set the
+		// the error to ErrInsufficientDiskSpace so that the error message is
+		// more concise and clear.
+		if errors.Is(err, upgradeErrors.ErrInsufficientDiskSpace) {
+			err = upgradeErrors.ErrInsufficientDiskSpace
+		}
+
 		det.Fail(err)
 		return err
 	}
@@ -824,10 +947,15 @@ func (c *Coordinator) watchRuntimeComponents(
 	state := make(map[string]runtime.ComponentState)
 
 	for {
+		var componentStates []runtime.ComponentComponentState
 		select {
 		case <-ctx.Done():
 			return
 		case componentState := <-runtimeComponentStates:
+			componentStates = append(componentStates, componentState)
+		case componentStates = <-otelComponentStates:
+		}
+		for _, componentState := range componentStates {
 			logComponentStateChange(c.logger, state, &componentState)
 			// Forward the final changes back to Coordinator, unless our context
 			// has ended.
@@ -836,19 +964,21 @@ func (c *Coordinator) watchRuntimeComponents(
 			case <-ctx.Done():
 				return
 			}
-		case componentStates := <-otelComponentStates:
-			for _, componentState := range componentStates {
-				logComponentStateChange(c.logger, state, &componentState)
-				// Forward the final changes back to Coordinator, unless our context
-				// has ended.
-				select {
-				case c.managerChans.runtimeManagerUpdate <- componentState:
-				case <-ctx.Done():
-					return
-				}
-			}
 		}
 	}
+}
+
+// ensureComponentWorkDirs ensures the component working directories exist for current components. This method is
+// idempotent.
+func (c *Coordinator) ensureComponentWorkDirs() error {
+	for _, comp := range c.componentModel {
+		c.logger.Debugf("Ensuring a working directory exists for component: %s", comp.ID)
+		err := comp.PrepareWorkDir(paths.Run())
+		if err != nil {
+			return fmt.Errorf("preparing a working directory for component %s failed: %w", comp.ID, err)
+		}
+	}
+	return nil
 }
 
 // logComponentStateChange emits a log message based on the new component state.
@@ -1457,6 +1587,8 @@ func (c *Coordinator) runLoopIteration(ctx context.Context) {
 
 // Always called on the main Coordinator goroutine.
 func (c *Coordinator) processConfig(ctx context.Context, cfg *config.Config) (err error) {
+	c.migrationProgressWg.Wait()
+
 	if c.otelMgr != nil {
 		c.otelCfg = cfg.OTel
 	}
@@ -1473,6 +1605,10 @@ func (c *Coordinator) processConfigAgent(ctx context.Context, cfg *config.Config
 
 	if err = info.InjectAgentConfig(cfg); err != nil {
 		return err
+	}
+
+	if err = c.secretMarkerFunc(c.logger, cfg); err != nil {
+		c.logger.Errorf("failed to add secret markers: %v", err)
 	}
 
 	// perform and verify ast translation
@@ -1627,6 +1763,12 @@ func (c *Coordinator) refreshComponentModel(ctx context.Context) (err error) {
 		return fmt.Errorf("generating component model: %w", err)
 	}
 
+	// ensure all components have working directories
+	err = c.ensureComponentWorkDirs()
+	if err != nil {
+		return fmt.Errorf("ensuring component work dirs exists: %w", err)
+	}
+
 	signed, err := component.SignedFromPolicy(c.derivedConfig)
 	if err != nil {
 		if !errors.Is(err, component.ErrNotFound) {
@@ -1661,7 +1803,7 @@ func (c *Coordinator) updateManagersWithConfig(model *component.Model) {
 		for _, comp := range otelModel.Components {
 			componentIDs = append(componentIDs, comp.ID)
 		}
-		c.logger.With("component_ids", componentIDs).Warn("The Otel runtime manager is HIGHLY EXPERIMENTAL and only intended for testing. Use at your own risk.")
+		c.logger.With("component_ids", componentIDs).Info("Using OpenTelemetry collector runtime.")
 	}
 	c.otelMgr.Update(c.otelCfg, otelModel.Components)
 }
@@ -1670,6 +1812,7 @@ func (c *Coordinator) updateManagersWithConfig(model *component.Model) {
 func (c *Coordinator) splitModelBetweenManagers(model *component.Model) (runtimeModel *component.Model, otelModel *component.Model) {
 	var otelComponents, runtimeComponents []component.Component
 	for _, comp := range model.Components {
+		c.maybeOverrideRuntimeForComponent(&comp)
 		switch comp.RuntimeManager {
 		case component.OtelRuntimeManager:
 			otelComponents = append(otelComponents, comp)
@@ -1689,6 +1832,25 @@ func (c *Coordinator) splitModelBetweenManagers(model *component.Model) (runtime
 		Signed:     model.Signed,
 	}
 	return
+}
+
+// maybeOverrideRuntimeForComponent sets the correct runtime for the given component.
+// Normally, we use the runtime set in the component itself via the configuration, but
+// we may also fall back to the process runtime if the otel runtime is unsupported for
+// some reason. One example is the output using unsupported config options.
+func (c *Coordinator) maybeOverrideRuntimeForComponent(comp *component.Component) {
+	if comp.RuntimeManager == component.ProcessRuntimeManager {
+		// do nothing, the process runtime can handle any component
+		return
+	}
+	if comp.RuntimeManager == component.OtelRuntimeManager {
+		// check if the component is actually supported
+		err := translate.VerifyComponentIsOtelSupported(comp)
+		if err != nil {
+			c.logger.Warnf("otel runtime is not supported for component %s, switching to process runtime, reason: %v", comp.ID, err)
+			comp.RuntimeManager = component.ProcessRuntimeManager
+		}
+	}
 }
 
 func (c *Coordinator) isFleetServer() bool {

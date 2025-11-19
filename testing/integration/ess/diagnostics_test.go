@@ -7,9 +7,12 @@
 package ess
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -277,24 +280,51 @@ func TestRedactFleetSecretPathsDiagnostics(t *testing.T) {
 	t.Log("Check if config files have been redacted.")
 	extractionDir := t.TempDir()
 	extractZipArchive(t, diagZip, extractionDir)
-	path := filepath.Join(extractionDir, "computed-config.yaml")
-	stat, err = os.Stat(path)
-	require.NoErrorf(t, err, "stat file %q failed", path)
-	require.Greaterf(t, stat.Size(), int64(0), "file %s has incorrect size", path)
-	f, err := os.Open(path)
-	require.NoErrorf(t, err, "open file %q failed", path)
-	defer f.Close()
-	var yObj struct {
-		SecretPaths []string `yaml:"secret_paths"`
-		Inputs      []struct {
-			CustomAttr string `yaml:"custom_attr"`
-		} `yaml:"inputs"`
+	fileNames := []string{
+		"pre-config.yaml",
+		"computed-config.yaml",
+		"components-expected.yaml",
+		"components-actual.yaml",
 	}
-	err = yaml.NewDecoder(f).Decode(&yObj)
-	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{"inputs.0.custom_attr"}, yObj.SecretPaths)
-	require.Len(t, yObj.Inputs, 1)
-	assert.Equal(t, "<REDACTED>", yObj.Inputs[0].CustomAttr)
+
+	var checkRedacted func(any) error
+	checkRedacted = func(root any) error {
+		switch root := root.(type) {
+		case map[string]any:
+			for rootKey, value := range root {
+				if rootKey == "custom_attr" {
+					if value != "<REDACTED>" {
+						return fmt.Errorf("found non-redacted value in %q", rootKey)
+					}
+				}
+				return checkRedacted(value)
+			}
+		case []any:
+			for _, value := range root {
+				return checkRedacted(value)
+			}
+		default:
+			// ignore other types
+		}
+		return nil
+	}
+
+	for _, fileName := range fileNames {
+		path := filepath.Join(extractionDir, fileName)
+		stat, err := os.Stat(path)
+		require.NoErrorf(t, err, "stat file %q failed", path)
+		require.Greaterf(t, stat.Size(), int64(0), "file %s has incorrect size", path)
+		f, err := os.Open(path)
+		require.NoErrorf(t, err, "open file %q failed", path)
+		defer f.Close()
+
+		var yObj map[string]any
+		err = yaml.NewDecoder(f).Decode(&yObj)
+		require.NoError(t, err)
+
+		err = checkRedacted(yObj)
+		require.NoError(t, err, "file %q has non-redacted values", path)
+	}
 }
 
 func TestBeatDiagnostics(t *testing.T) {
@@ -398,15 +428,128 @@ agent.monitoring.enabled: false
 					"Runtime":   tc.runtime,
 					"InputFile": inputFile.Name(),
 				}))
+			expDiagFiles := append([]string{}, diagnosticsFiles...)
+			if tc.runtime == "otel" {
+				// EDOT adds these extra files.
+				// TestBeatDiagnostics is quite strict about what it expects to see in the archive.
+				expDiagFiles = append(expDiagFiles,
+					"edot/goroutine.profile.gz",
+					"edot/heap.profile.gz",
+					"edot/allocs.profile.gz",
+					"edot/block.profile.gz",
+					"edot/mutex.profile.gz",
+					"edot/threadcreate.profile.gz",
+					"edot/otel-merged-actual.yaml")
+			}
 			err = f.Run(ctx, integrationtest.State{
 				Configure:  configBuffer.String(),
 				AgentState: tc.expectedAgentState,
 				Components: tc.expectedComponentState,
-				After:      testDiagnosticsFactory(t, filebeatSetup, diagnosticsFiles, tc.expectedCompDiagnosticsFiles, f, []string{"diagnostics", "collect"}),
+				After:      testDiagnosticsFactory(t, filebeatSetup, expDiagFiles, tc.expectedCompDiagnosticsFiles, f, []string{"diagnostics", "collect"}),
 			})
 			assert.NoError(t, err)
 		})
 	}
+}
+
+func TestEDOTDiagnostics(t *testing.T) {
+	define.Require(t, define.Requirements{
+		Group: integration.Default,
+		Local: false,
+	})
+
+	configTemplate := `
+inputs:
+  - id: filestream-filebeat
+    type: filestream
+    paths:
+      - {{ .InputFile }}
+    prospector.scanner.fingerprint.enabled: false
+    file_identity.native: ~
+    use_output: default
+    _runtime_experimental: otel
+agent.grpc:
+    port: 6790
+outputs:
+  default:
+    type: elasticsearch
+    hosts: [http://localhost:9200]
+    api_key: placeholder
+agent.monitoring.enabled: false
+`
+
+	ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(10*time.Minute))
+	defer cancel()
+
+	// Create the fixture
+	f, err := define.NewFixtureFromLocalBuild(t, define.Version(), integrationtest.WithAllowErrors())
+	require.NoError(t, err)
+
+	// Create the data file to ingest
+	inputFile, err := os.CreateTemp(t.TempDir(), "input.txt")
+	require.NoError(t, err, "failed to create temp file to hold data to ingest")
+	t.Cleanup(func() {
+		cErr := inputFile.Close()
+		assert.NoError(t, cErr)
+	})
+	_, err = inputFile.WriteString("hello world\n")
+	require.NoError(t, err, "failed to write data to temp file")
+
+	var configBuffer bytes.Buffer
+	require.NoError(t,
+		template.Must(template.New("config").Parse(configTemplate)).Execute(&configBuffer, map[string]any{
+			"InputFile": inputFile.Name(),
+		}))
+	err = f.Prepare(ctx)
+	require.NoError(t, err)
+
+	err = f.Configure(ctx, configBuffer.Bytes())
+	require.NoError(t, err)
+	cmd, err := f.PrepareAgentCommand(ctx, []string{"-e"})
+	require.NoError(t, err)
+
+	output := strings.Builder{}
+	cmd.Stderr = &output
+	cmd.Stdout = &output
+
+	err = cmd.Start()
+	require.NoError(t, err)
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		err = f.IsHealthy(ctx)
+		require.NoErrorf(collect, err, "agent is not healthy: %s", err)
+		require.Containsf(collect, output.String(), "Diagnostics extension started", "expected log: %s", output.String())
+	}, 30*time.Second, 1*time.Second)
+
+	diagZip, err := f.ExecDiagnostics(ctx)
+	extractionDir := t.TempDir()
+
+	stat, err := os.Stat(diagZip)
+	require.NoErrorf(t, err, "stat file %q failed", diagZip)
+	require.Greaterf(t, stat.Size(), int64(0), "file %s has incorrect size", diagZip)
+
+	extractZipArchive(t, diagZip, extractionDir)
+
+	expectedFiles := []string{
+		"edot/otel-merged-actual.yaml",
+		"edot/allocs.profile.gz",
+		"edot/block.profile.gz",
+		"edot/goroutine.profile.gz",
+		"edot/heap.profile.gz",
+		"edot/mutex.profile.gz",
+		"edot/threadcreate.profile.gz",
+		"components/filestream-default/registry.tar.gz",
+		"components/filestream-default/beat_metrics.json",
+		"components/filestream-default/input_metrics.json",
+	}
+
+	for _, f := range expectedFiles {
+		path := filepath.Join(extractionDir, f)
+		stat, err := os.Stat(path)
+		require.NoErrorf(t, err, "stat file %q failed", path)
+		require.Greaterf(t, stat.Size(), int64(0), "file %s has incorrect size", path)
+	}
+	verifyFilebeatRegistry(t, filepath.Join(extractionDir, "components/filestream-default/registry.tar.gz"))
 }
 
 func testDiagnosticsFactory(t *testing.T, compSetup map[string]integrationtest.ComponentState, diagFiles []string, diagCompFiles []string, fix *integrationtest.Fixture, cmd []string) func(ctx context.Context) error {
@@ -590,4 +733,24 @@ func extractKeysFromMap[K comparable, V any](src map[K]V) []K {
 type filePattern struct {
 	pattern  string
 	optional bool
+}
+
+func verifyFilebeatRegistry(t *testing.T, path string) {
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	gzReader, err := gzip.NewReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	tarReader := tar.NewReader(gzReader)
+	hdr, err := tarReader.Next()
+	require.NoError(t, err)
+	assert.Equal(t, "registry", hdr.Name)
+	hdr, err = tarReader.Next()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("registry", "filebeat"), hdr.Name)
+	hdr, err = tarReader.Next()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("registry", "filebeat", "log.json"), hdr.Name)
+	hdr, err = tarReader.Next()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("registry", "filebeat", "meta.json"), hdr.Name)
 }
